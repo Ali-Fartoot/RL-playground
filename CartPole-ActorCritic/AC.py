@@ -1,8 +1,8 @@
 import numpy as np
-import torch.nn as nn
 import torch
+import torch.nn as nn
+import torch.optim as optim
 from collections import deque
-from collections import defaultdict
 
 class Policy(nn.Module):
     def __init__(self, state_size=4, action_size=2, hidden_size=32):
@@ -11,19 +11,15 @@ class Policy(nn.Module):
         self.fc2 = nn.Linear(hidden_size, action_size)
     
     def forward(self, x):
-        x = self.fc1(x)
-        x = nn.ReLU()(x)
-        x = self.fc2(x)
-        return nn.Softmax(dim=1)(x)
+        x = torch.relu(self.fc1(x))
+        return nn.Softmax(dim=1)(self.fc2(x))
     
     def act(self, state):
         state = torch.from_numpy(state).float().unsqueeze(0).to(device="cpu")
         probs = self.forward(state).cpu()
         m = torch.distributions.Categorical(probs)
         action = m.sample()
-
         return action.item(), m.log_prob(action)
-    
 
 class ValueNetwork(nn.Module):
     def __init__(self, state_size=4, hidden_size=32):
@@ -32,61 +28,55 @@ class ValueNetwork(nn.Module):
         self.fc2 = nn.Linear(hidden_size, 1)
     
     def forward(self, x):
-        x = self.fc1(x)
-        x = torch.relu(x)
-        x = self.fc2(x)
-        return x
+        x = torch.relu(self.fc1(x))
+        return self.fc2(x)
 
+def compute_returns(rewards, gamma):
+    R = 0
+    returns = []
+    for r in reversed(rewards):
+        R = r + gamma * R
+        returns.insert(0, R)
+    return returns
 
-def A2C(policy, value_net, env, optimizer_policy, optimizer_value, n_episodes=2000, max_t=1000, gamma=0.99, print_every=100):
+def A2C(policy, value_net, env, optimizer_policy, optimizer_value, n_episodes=500, max_t=1000, gamma=0.99, print_every=100):
     scores_deque = deque(maxlen=100)
     scores = []
 
     for e in range(1, n_episodes + 1):
-        saved_log_probs = []
-        values = []
-        rewards = []
         state = env.reset()
-
         if isinstance(state, tuple):
             state = state[0]
         
+        saved_log_probs = []
+        values = []
+        rewards = []
+        
         for t in range(max_t):
-            state_tensor = torch.from_numpy(state).float().unsqueeze(0).to(device="cpu")
+            state_tensor = torch.from_numpy(state).float().unsqueeze(0)
             action, log_prob = policy.act(state)
-            saved_log_probs.append(log_prob)
+            value = value_net(state_tensor)
             
             next_state, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
             
+            saved_log_probs.append(log_prob)
+            values.append(value)
             rewards.append(reward)
-            values.append(value_net(state_tensor).item())
             
             if done:
                 break
-
+            
             state = next_state
         
-        next_state_tensor = torch.from_numpy(next_state).float().unsqueeze(0).to(device="cpu")
-        next_value = value_net(next_state_tensor).item()
-        values.append(next_value)
-
-        returns = np.zeros_like(rewards, dtype=np.float32)
-        advantages = np.zeros_like(rewards, dtype=np.float32)
+        returns = compute_returns(rewards, gamma)
+        returns = torch.tensor(returns)
+        values = torch.cat(values)
         
-        R = 0
-        for t in reversed(range(len(rewards))):
-            R = rewards[t] + gamma * R
-            returns[t] = R
-            advantages[t] = R - values[t]
+        advantages = returns - values.detach()
         
-        returns = torch.tensor(returns, dtype=torch.float).to(device="cpu")
-        saved_log_probs = torch.stack(saved_log_probs).to(device="cpu")
-        advantages = torch.tensor(advantages, dtype=torch.float).to(device="cpu")
-        
-        policy_loss = -torch.sum(saved_log_probs * advantages)
-
-        value_loss = torch.nn.MSELoss()(torch.tensor(values[:-1], dtype=torch.float).to(device="cpu"), returns[:-1])
+        policy_loss = -(torch.stack(saved_log_probs) * advantages).mean()
+        value_loss = nn.MSELoss()(values, returns)
         
         optimizer_policy.zero_grad()
         policy_loss.backward()
@@ -100,4 +90,6 @@ def A2C(policy, value_net, env, optimizer_policy, optimizer_value, n_episodes=20
         scores.append(sum(rewards))
         
         if e % print_every == 0:
-            print(f"Episode {e}\tAverage Score: {np.mean(scores_deque)}")
+            print(f"Episode {e}\tAverage Score: {np.mean(scores_deque):.2f}")
+    
+    return scores
